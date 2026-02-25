@@ -52,6 +52,9 @@ export const ru = {
     createTask: 'Создать задачу',
     edit: 'Редактировать',
     deleteTask: 'Удалить задачу',
+    addMember: 'Добавить участника',
+    removeMember: 'Удалить',
+    changeRole: 'Сменить роль',
   },
 
   // Dashboard page
@@ -79,6 +82,11 @@ export const ru = {
     notFound: 'Проект не найден',
     allTasks: 'Все задачи',
     pendingReview: 'На проверке',
+    addMemberPlaceholder: '@username',
+    removeConfirm: 'Удалить участника?',
+    memberAdded: 'Участник добавлен',
+    memberRemoved: 'Участник удалён',
+    roleChanged: 'Роль изменена',
   },
 
   // Tasks page
@@ -149,9 +157,27 @@ export const ru = {
     reminderTime: 'Время напоминаний',
     accessToken: 'Токен доступа',
     generateToken: 'Сгенерировать токен',
-    copyLink: 'Скопировать ссылку',
-    linkCopied: 'Ссылка скопирована!',
+    copyLink: 'Скопировать',
+    linkCopied: 'Скопировано!',
     tokenDescription: 'Изолированный доступ к проекту по ссылке',
+    accessTokens: 'Токены доступа',
+    tokensDescription: 'Создайте ссылки с разным уровнем доступа',
+    regenerateToken: 'Перегенерировать',
+    revokeToken: 'Отозвать',
+    revokeConfirm: 'Отозвать этот токен? Ссылка перестанет работать.',
+    tokenRevoked: 'Токен отозван',
+    tokenCreated: 'Токен создан',
+    noTokens: 'Нет токенов',
+  },
+
+  // Token roles
+  tokenRole: {
+    observer: 'Наблюдатель',
+    executor: 'Исполнитель',
+    manager: 'Руководитель',
+    observerDesc: 'Только просмотр — статистика, задачи, участники',
+    executorDesc: 'Может менять статус задач (Начать, На проверку)',
+    managerDesc: 'Полный доступ — создание задач, одобрение, отклонение',
   },
 
   // Errors

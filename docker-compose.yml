@@ -1,0 +1,19 @@
+name: taskobot
+
+services:
+  backend:
+    build: ./backend
+    container_name: taskobot-backend
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    container_name: taskobot-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped

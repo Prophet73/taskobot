@@ -10,7 +10,7 @@ import secrets
 
 from models import (
     User, Project, ProjectMembership, Task, Role, TaskStatus, TaskPriority,
-    TaskComment, TaskHistory, TaskHistoryAction
+    TaskComment, TaskHistory, TaskHistoryAction, ProjectToken, TokenRole
 )
 
 
@@ -140,12 +140,13 @@ def get_user_projects(db: Session, user_id: int) -> List[Project]:
     ).all()
 
 
-def create_project(db: Session, chat_id: int, name: str, description: str = None) -> Project:
+def create_project(db: Session, chat_id: int = None, name: str = "", description: str = None, created_by_user_id: int = None) -> Project:
     """Создать новый проект"""
     project = Project(
         chat_id=chat_id,
         name=name,
-        description=description
+        description=description,
+        created_by_user_id=created_by_user_id
     )
     db.add(project)
     db.commit()
@@ -520,7 +521,7 @@ def delete_comment(db: Session, comment_id: int, user_id: int) -> bool:
 # ============ Project Token Operations ============
 
 def generate_project_token(db: Session, project_id: int) -> str:
-    """Сгенерировать токен доступа для проекта"""
+    """Сгенерировать токен доступа для проекта (legacy — сохраняет в projects.access_token)"""
     token = secrets.token_urlsafe(32)
     project = get_project(db, project_id)
     if project:
@@ -530,12 +531,73 @@ def generate_project_token(db: Session, project_id: int) -> str:
     return token
 
 
-def get_project_by_token(db: Session, token: str) -> Optional[Project]:
-    """Получить проект по токену доступа"""
-    return db.query(Project).filter(
+def create_project_token(db: Session, project_id: int, role: TokenRole, member_id: Optional[int] = None) -> ProjectToken:
+    """Создать токен доступа. Для observer/manager — один на роль (перегенерация). Для executor — один на участника."""
+    # Отзываем существующий токен с той же ролью (+member_id для executor)
+    query = db.query(ProjectToken).filter(
+        ProjectToken.project_id == project_id,
+        ProjectToken.role == role,
+        ProjectToken.is_active == True
+    )
+    if role == TokenRole.EXECUTOR:
+        query = query.filter(ProjectToken.member_id == member_id)
+    for old in query.all():
+        old.is_active = False
+
+    token = secrets.token_urlsafe(32)
+    project_token = ProjectToken(
+        project_id=project_id,
+        token=token,
+        role=role,
+        member_id=member_id if role == TokenRole.EXECUTOR else None,
+    )
+    db.add(project_token)
+    db.commit()
+    db.refresh(project_token)
+    return project_token
+
+
+def get_project_tokens(db: Session, project_id: int) -> List[ProjectToken]:
+    """Получить все активные токены проекта"""
+    return db.query(ProjectToken).filter(
+        ProjectToken.project_id == project_id,
+        ProjectToken.is_active == True
+    ).order_by(ProjectToken.role, ProjectToken.created_at.desc()).all()
+
+
+def get_project_by_token(db: Session, token: str):
+    """Получить проект по токену. Возвращает (Project, TokenRole, member_id) или None."""
+    pt = db.query(ProjectToken).filter(
+        ProjectToken.token == token,
+        ProjectToken.is_active == True
+    ).first()
+    if pt:
+        project = db.query(Project).filter(
+            Project.id == pt.project_id,
+            Project.is_active == True
+        ).first()
+        if project:
+            return project, pt.role, pt.member_id
+
+    # Fallback: старая колонка access_token
+    project = db.query(Project).filter(
         Project.access_token == token,
         Project.is_active == True
     ).first()
+    if project:
+        return project, TokenRole.OBSERVER, None
+
+    return None
+
+
+def revoke_project_token(db: Session, token_id: int) -> bool:
+    """Деактивировать токен по ID"""
+    pt = db.query(ProjectToken).filter(ProjectToken.id == token_id).first()
+    if pt:
+        pt.is_active = False
+        db.commit()
+        return True
+    return False
 
 
 def update_project_settings(
@@ -554,6 +616,71 @@ def update_project_settings(
         db.commit()
         db.refresh(project)
     return project
+
+
+def delete_project(db: Session, project_id: int) -> bool:
+    """Удалить проект (деактивировать)"""
+    project = get_project(db, project_id)
+    if not project:
+        return False
+    project.is_active = False
+    db.commit()
+    return True
+
+
+def set_active_project(db: Session, user_id: int, project_id: int) -> None:
+    """Установить активный проект (комнату) для пользователя"""
+    user = get_user(db, user_id)
+    if user:
+        user.active_project_id = project_id
+        db.commit()
+
+
+def get_active_project(db: Session, user_id: int) -> Optional[Project]:
+    """Получить активный проект пользователя"""
+    user = get_user(db, user_id)
+    if user and user.active_project_id:
+        project = get_project(db, user.active_project_id)
+        if project and project.is_active:
+            return project
+    return None
+
+
+# ============ DM Project Operations ============
+
+def create_dm_project(db: Session, creator_id: int, name: str, description: str = None) -> Project:
+    """Создать проект из ЛС (без chat_id), добавить создателя как MANAGER"""
+    project = create_project(db, chat_id=None, name=name, description=description, created_by_user_id=creator_id)
+    add_member_to_project(db, creator_id, project.id, Role.MANAGER)
+    return project
+
+
+def set_user_can_create_projects(db: Session, user_id: int, allowed: bool) -> Optional[User]:
+    """Включить/выключить право создавать проекты (whitelist)"""
+    user = get_user(db, user_id)
+    if user:
+        user.can_create_projects = allowed
+        db.commit()
+        db.refresh(user)
+    return user
+
+
+def add_member_by_username(db: Session, project_id: int, username: str, role: Role = Role.EXECUTOR) -> Optional[ProjectMembership]:
+    """Найти или создать пользователя по @username и добавить в проект"""
+    user = get_user_by_username(db, username)
+    if not user:
+        user = create_placeholder_user(db, username)
+    return add_member_to_project(db, user.id, project_id, role)
+
+
+def remove_member(db: Session, project_id: int, user_id: int) -> bool:
+    """Удалить участника из проекта"""
+    membership = get_membership(db, user_id, project_id)
+    if membership:
+        db.delete(membership)
+        db.commit()
+        return True
+    return False
 
 
 # ============ Tasks for Review ============

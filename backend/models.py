@@ -46,6 +46,13 @@ class TaskPriority(str, Enum):
     URGENT = "urgent"
 
 
+class TokenRole(str, Enum):
+    """Роли токенов доступа к проекту"""
+    OBSERVER = "observer"
+    EXECUTOR = "executor"
+    MANAGER = "manager"
+
+
 class User(Base):
     """
     Глобальный пользователь системы.
@@ -59,6 +66,8 @@ class User(Base):
     username = Column(String(255), index=True)  # @username без @
     full_name = Column(String(255))
     is_superadmin = Column(Boolean, default=False)  # Глобальный админ всей системы
+    can_create_projects = Column(Boolean, default=False)  # Whitelist: может создавать проекты
+    active_project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)  # Текущий проект-комната
     created_at = Column(DateTime, default=datetime.utcnow)
     last_seen = Column(DateTime, default=datetime.utcnow)
 
@@ -71,16 +80,16 @@ class User(Base):
 
 class Project(Base):
     """
-    Проект = Telegram чат.
-    Каждый чат - отдельный изолированный проект.
+    Проект. Может быть создан в ЛС (chat_id=None) или привязан к чату.
     """
     __tablename__ = "projects"
 
     id = Column(Integer, primary_key=True, index=True)
-    chat_id = Column(BigInteger, unique=True, index=True, nullable=False)
+    chat_id = Column(BigInteger, unique=True, index=True, nullable=True)
     name = Column(String(255), nullable=False)
     description = Column(Text, nullable=True)
     is_active = Column(Boolean, default=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     # Настройки напоминаний
@@ -93,6 +102,12 @@ class Project(Base):
     # Связи
     memberships = relationship("ProjectMembership", back_populates="project", cascade="all, delete-orphan")
     tasks = relationship("Task", back_populates="project", cascade="all, delete-orphan")
+    tokens = relationship("ProjectToken", back_populates="project", cascade="all, delete-orphan")
+
+    @property
+    def members(self):
+        """Alias for Pydantic schema compatibility"""
+        return self.memberships
 
 
 class ProjectMembership(Base):
@@ -163,6 +178,23 @@ class AuthCode(Base):
 
     # Связи
     user = relationship("User", back_populates="auth_codes")
+
+
+class ProjectToken(Base):
+    """Токены доступа к проекту с разными ролями"""
+    __tablename__ = "project_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    token = Column(String(64), unique=True, nullable=False, index=True)
+    role = Column(SQLEnum(TokenRole), nullable=False, default=TokenRole.OBSERVER)
+    member_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # Для executor — привязка к участнику
+    created_at = Column(DateTime, default=datetime.utcnow)
+    is_active = Column(Boolean, default=True)
+
+    # Связи
+    project = relationship("Project", back_populates="tokens")
+    member = relationship("User")
 
 
 class TaskComment(Base):

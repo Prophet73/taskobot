@@ -43,6 +43,9 @@ export const getProjects = () => api.get('/projects');
 export const getProject = (id) => api.get(`/projects/${id}`);
 export const getProjectStats = (id) => api.get(`/projects/${id}/stats`);
 export const getProjectMembers = (id) => api.get(`/projects/${id}/members`);
+export const addProjectMember = (id, data) => api.post(`/projects/${id}/members`, data);
+export const removeProjectMember = (projectId, userId) => api.delete(`/projects/${projectId}/members/${userId}`);
+export const updateMemberRole = (projectId, userId, data) => api.patch(`/projects/${projectId}/members/${userId}`, data);
 
 // Tasks
 export const getTasks = (params = {}) => api.get('/tasks', { params });
@@ -68,8 +71,17 @@ export const getTaskHistory = (taskId) => api.get(`/tasks/${taskId}/history`);
 export const updateProjectSettings = (projectId, data) => api.patch(`/projects/${projectId}/settings`, data);
 export const generateProjectToken = (projectId) => api.post(`/projects/${projectId}/token`);
 
+// Project Tokens (role-based)
+export const createProjectToken = (projectId, role, memberId = null) =>
+  api.post(`/projects/${projectId}/tokens`, { role, member_id: memberId });
+export const getProjectTokens = (projectId) => api.get(`/projects/${projectId}/tokens`);
+export const revokeProjectToken = (projectId, tokenId) => api.delete(`/projects/${projectId}/tokens/${tokenId}`);
+
 // Project by Token (isolated access)
 export const getProjectByToken = (token) => api.get('/project-by-token', { params: { token } });
+
+// Token-auth task actions (public, no JWT needed)
+export const updateTaskByToken = (token, taskId, data) => api.patch(`/token-tasks/${taskId}`, data, { params: { token } });
 
 // WebApp Auth
 export const webappLogin = (initData) => api.post('/auth/webapp', { init_data: initData });

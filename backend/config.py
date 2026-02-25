@@ -11,7 +11,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 # Database
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./tasktracker.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data/tasktracker.db")
 
 # Morning reminder time (hour in UTC)
 MORNING_REMINDER_HOUR = int(os.getenv("MORNING_REMINDER_HOUR", "6"))  # 6 UTC = 9 MSK

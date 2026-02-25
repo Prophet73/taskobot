@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import { updateTask } from '../api/client';
+import { updateTask, updateTaskByToken } from '../api/client';
 import { Check, Clock, AlertTriangle, User, Play, FileCheck, MessageSquare, RotateCcw } from 'lucide-react';
 import { ru } from '../locales/ru';
 
@@ -19,13 +19,17 @@ const priorityConfig = {
   low: { label: ru.priority.low, color: 'bg-gray-500' },
 };
 
-function TaskCard({ task, onUpdate, isManager = false, readOnly = false }) {
+function TaskCard({ task, onUpdate, isManager = false, readOnly = false, tokenAuth = null }) {
   const [updating, setUpdating] = useState(false);
 
   const handleStatusChange = async (newStatus) => {
     setUpdating(true);
     try {
-      await updateTask(task.id, { status: newStatus });
+      if (tokenAuth) {
+        await updateTaskByToken(tokenAuth, task.id, { status: newStatus });
+      } else {
+        await updateTask(task.id, { status: newStatus });
+      }
       if (onUpdate) onUpdate();
     } catch (err) {
       console.error('Failed to update task:', err);
@@ -53,9 +57,13 @@ function TaskCard({ task, onUpdate, isManager = false, readOnly = false }) {
           {/* Priority indicator */}
           <div className="flex items-center space-x-2 mb-2">
             <span className={`w-2 h-2 rounded-full ${priority.color}`}></span>
-            <Link to={`/tasks/${task.id}`} className="text-xs text-gray-500 hover:text-blue-400 transition-colors">
-              #{task.id}
-            </Link>
+            {tokenAuth ? (
+              <span className="text-xs text-gray-500">#{task.id}</span>
+            ) : (
+              <Link to={`/tasks/${task.id}`} className="text-xs text-gray-500 hover:text-blue-400 transition-colors">
+                #{task.id}
+              </Link>
+            )}
             <span className={`text-xs px-2 py-0.5 rounded ${status.color}`}>
               {status.label}
             </span>
@@ -75,13 +83,15 @@ function TaskCard({ task, onUpdate, isManager = false, readOnly = false }) {
               </span>
             )}
             <span>{formatDate(task.created_at)}</span>
-            <Link
-              to={`/tasks/${task.id}`}
-              className="flex items-center text-gray-500 hover:text-blue-400 transition-colors"
-            >
-              <MessageSquare size={14} className="mr-1" />
-              {ru.actions.comment}
-            </Link>
+            {!tokenAuth && (
+              <Link
+                to={`/tasks/${task.id}`}
+                className="flex items-center text-gray-500 hover:text-blue-400 transition-colors"
+              >
+                <MessageSquare size={14} className="mr-1" />
+                {ru.actions.comment}
+              </Link>
+            )}
           </div>
         </div>
 

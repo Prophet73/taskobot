@@ -40,6 +40,12 @@ class TaskPriorityEnum(str, Enum):
     URGENT = "urgent"
 
 
+class TokenRoleEnum(str, Enum):
+    OBSERVER = "observer"
+    EXECUTOR = "executor"
+    MANAGER = "manager"
+
+
 # ============ Auth Schemas ============
 
 class AuthCodeRequest(BaseModel):
@@ -106,6 +112,12 @@ class MembershipUpdate(BaseModel):
     role: RoleEnum
 
 
+class MembershipAdd(BaseModel):
+    """Добавление участника по username"""
+    username: str
+    role: RoleEnum = RoleEnum.EXECUTOR
+
+
 # ============ Task Schemas ============
 
 class TaskBase(BaseModel):
@@ -147,7 +159,7 @@ class TaskResponse(TaskBase):
 # ============ Project Schemas ============
 
 class ProjectBase(BaseModel):
-    chat_id: int
+    chat_id: Optional[int] = None
     name: str
     description: Optional[str] = None
 
@@ -172,6 +184,9 @@ class ProjectWithDetails(ProjectResponse):
     """Проект с задачами и участниками"""
     tasks: List[TaskResponse] = []
     members: List[MembershipResponse] = []
+
+    class Config:
+        from_attributes = True
 
 
 class ProjectStats(BaseModel):
@@ -264,9 +279,29 @@ class ProjectSettingsUpdate(BaseModel):
     reminder_time: Optional[str] = None  # "HH:MM"
 
 
-class ProjectTokenResponse(BaseModel):
-    """Токен доступа к проекту"""
+class ProjectTokenLegacyResponse(BaseModel):
+    """Токен доступа к проекту (legacy)"""
     access_token: str
+
+
+class ProjectTokenCreate(BaseModel):
+    """Создание токена с ролью"""
+    role: TokenRoleEnum
+    member_id: Optional[int] = None  # Для executor — ID пользователя
+
+
+class ProjectTokenResponse(BaseModel):
+    """Ответ с токеном проекта"""
+    id: int
+    token: str
+    role: TokenRoleEnum
+    member_id: Optional[int] = None
+    member: Optional[UserResponse] = None
+    created_at: datetime
+    is_active: bool = True
+
+    class Config:
+        from_attributes = True
 
 
 class ProjectByTokenResponse(BaseModel):
@@ -274,6 +309,9 @@ class ProjectByTokenResponse(BaseModel):
     project: ProjectResponse
     stats: ProjectStats
     tasks: List[TaskResponse]
+    token_role: TokenRoleEnum
+    member_id: Optional[int] = None
+    members: List[MembershipResponse] = []
 
 
 # ============ WebApp Auth Schemas ============

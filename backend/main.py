@@ -13,13 +13,14 @@ from sqlalchemy.orm import Session
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from database import get_db, init_db
-from models import Project, Task, User, ProjectMembership, Role, TaskStatus, TaskPriority
+from models import Project, Task, User, ProjectMembership, Role, TaskStatus, TaskPriority, TokenRole
 from schemas import (
     ProjectResponse, ProjectWithDetails, TaskResponse, TaskUpdate, TaskCreate,
-    ProjectStats, DashboardData, MembershipResponse, MembershipUpdate,
+    ProjectStats, DashboardData, MembershipResponse, MembershipUpdate, MembershipAdd,
     UserResponse, AuthCodeRequest, AuthResponse, ReminderRequest, ReminderResponse,
     MyTasksResponse, CommentCreate, CommentResponse, TaskHistoryResponse,
-    ProjectSettingsUpdate, ProjectTokenResponse, ProjectByTokenResponse,
+    ProjectSettingsUpdate, ProjectTokenLegacyResponse, ProjectByTokenResponse,
+    ProjectTokenCreate, ProjectTokenResponse, TokenRoleEnum,
     WebAppAuthRequest
 )
 import crud
@@ -231,6 +232,51 @@ async def update_member_role(
         raise HTTPException(status_code=404, detail="Membership not found")
 
     return updated
+
+
+@app.post("/api/projects/{project_id}/members", response_model=MembershipResponse)
+async def add_project_member(
+    project_id: int,
+    data: MembershipAdd,
+    current_user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Добавить участника в проект по username (manager+)"""
+    membership = check_project_access(db, current_user, project_id, Role.MANAGER)
+    if not membership:
+        raise HTTPException(status_code=403, detail="Access denied - manager role required")
+
+    username = data.username.lstrip("@").strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="Username is required")
+
+    role = Role(data.role.value)
+    result = crud.add_member_by_username(db, project_id, username, role)
+    if not result:
+        raise HTTPException(status_code=400, detail="Failed to add member")
+
+    return result
+
+
+@app.delete("/api/projects/{project_id}/members/{user_id}")
+async def remove_project_member(
+    project_id: int,
+    user_id: int,
+    current_user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Удалить участника из проекта (manager+)"""
+    membership = check_project_access(db, current_user, project_id, Role.MANAGER)
+    if not membership:
+        raise HTTPException(status_code=403, detail="Access denied - manager role required")
+
+    if user_id == current_user.user_id and not current_user.is_superadmin:
+        raise HTTPException(status_code=400, detail="Cannot remove yourself")
+
+    if not crud.remove_member(db, project_id, user_id):
+        raise HTTPException(status_code=404, detail="Member not found")
+
+    return {"status": "removed"}
 
 
 # ============ Tasks Routes (Protected) ============
@@ -615,19 +661,79 @@ async def update_project_settings(
     return project
 
 
-@app.post("/api/projects/{project_id}/token", response_model=ProjectTokenResponse)
-async def generate_project_token(
+@app.post("/api/projects/{project_id}/token", response_model=ProjectTokenLegacyResponse)
+async def generate_project_token_legacy(
     project_id: int,
     current_user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Сгенерировать токен доступа для проекта (manager+)"""
+    """Сгенерировать токен доступа для проекта (legacy, manager+)"""
     membership = check_project_access(db, current_user, project_id, Role.MANAGER)
     if not membership:
         raise HTTPException(status_code=403, detail="Access denied")
 
     token = crud.generate_project_token(db, project_id)
-    return ProjectTokenResponse(access_token=token)
+    return ProjectTokenLegacyResponse(access_token=token)
+
+
+# ============ Project Tokens (Role-based) ============
+
+@app.post("/api/projects/{project_id}/tokens", response_model=ProjectTokenResponse)
+async def create_project_token(
+    project_id: int,
+    data: ProjectTokenCreate,
+    current_user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Создать токен доступа с ролью (manager+). Для executor — нужен member_id."""
+    membership = check_project_access(db, current_user, project_id, Role.MANAGER)
+    if not membership:
+        raise HTTPException(status_code=403, detail="Access denied - manager role required")
+
+    role = TokenRole(data.role.value)
+
+    if role == TokenRole.EXECUTOR:
+        if not data.member_id:
+            raise HTTPException(status_code=400, detail="member_id is required for executor tokens")
+        # Проверяем что пользователь — участник проекта
+        member = crud.get_membership(db, data.member_id, project_id)
+        if not member:
+            raise HTTPException(status_code=404, detail="User is not a member of this project")
+
+    pt = crud.create_project_token(db, project_id, role, member_id=data.member_id)
+    return pt
+
+
+@app.get("/api/projects/{project_id}/tokens", response_model=List[ProjectTokenResponse])
+async def get_project_tokens(
+    project_id: int,
+    current_user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Получить все токены проекта (manager+)"""
+    membership = check_project_access(db, current_user, project_id, Role.MANAGER)
+    if not membership:
+        raise HTTPException(status_code=403, detail="Access denied - manager role required")
+
+    return crud.get_project_tokens(db, project_id)
+
+
+@app.delete("/api/projects/{project_id}/tokens/{token_id}")
+async def revoke_project_token(
+    project_id: int,
+    token_id: int,
+    current_user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Отозвать токен проекта (manager+)"""
+    membership = check_project_access(db, current_user, project_id, Role.MANAGER)
+    if not membership:
+        raise HTTPException(status_code=403, detail="Access denied - manager role required")
+
+    if not crud.revoke_project_token(db, token_id):
+        raise HTTPException(status_code=404, detail="Token not found")
+
+    return {"status": "revoked"}
 
 
 # ============ Token-based Access (Public) ============
@@ -638,12 +744,19 @@ async def get_project_by_token(
     db: Session = Depends(get_db)
 ):
     """Получить проект по токену доступа (публичный endpoint)"""
-    project = crud.get_project_by_token(db, token)
-    if not project:
+    result = crud.get_project_by_token(db, token)
+    if not result:
         raise HTTPException(status_code=404, detail="Invalid token or project not found")
+
+    project, token_role, member_id = result
 
     stats = crud.get_project_stats(db, project.id)
     tasks = crud.get_project_tasks(db, project.id)
+    members = crud.get_project_members(db, project.id)
+
+    # Executor с привязкой к участнику — показываем только его задачи
+    if token_role == TokenRole.EXECUTOR and member_id:
+        tasks = [t for t in tasks if t.assignee_id == member_id]
 
     return ProjectByTokenResponse(
         project=ProjectResponse.model_validate(project),
@@ -652,8 +765,79 @@ async def get_project_by_token(
             project_name=project.name,
             **stats
         ),
-        tasks=[TaskResponse.model_validate(t) for t in tasks]
+        tasks=[TaskResponse.model_validate(t) for t in tasks],
+        token_role=TokenRoleEnum(token_role.value),
+        member_id=member_id,
+        members=[MembershipResponse.model_validate(m) for m in members]
     )
+
+
+@app.patch("/api/token-tasks/{task_id}", response_model=TaskResponse)
+async def update_task_by_token(
+    task_id: int,
+    update: TaskUpdate,
+    token: str = Query(...),
+    db: Session = Depends(get_db)
+):
+    """Обновить задачу через токен доступа (публичный endpoint с проверкой роли)"""
+    result = crud.get_project_by_token(db, token)
+    if not result:
+        raise HTTPException(status_code=404, detail="Invalid token")
+
+    project, token_role, member_id = result
+
+    task = crud.get_task(db, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if task.project_id != project.id:
+        raise HTTPException(status_code=403, detail="Task does not belong to this project")
+
+    # Executor с привязкой — может менять только свои задачи
+    if token_role == TokenRole.EXECUTOR and member_id and task.assignee_id != member_id:
+        raise HTTPException(status_code=403, detail="This token can only modify tasks assigned to its member")
+
+    # Observer — только просмотр
+    if token_role == TokenRole.OBSERVER:
+        raise HTTPException(status_code=403, detail="Observer tokens cannot modify tasks")
+
+    # Executor — может менять только статус (start, to_review)
+    if token_role == TokenRole.EXECUTOR:
+        if not update.status:
+            raise HTTPException(status_code=403, detail="Executor can only change task status")
+        allowed_transitions = {
+            TaskStatus.PENDING: [TaskStatus.IN_PROGRESS],
+            TaskStatus.IN_PROGRESS: [TaskStatus.PENDING_REVIEW],
+        }
+        current = task.status
+        target = TaskStatus(update.status.value)
+        if target not in allowed_transitions.get(current, []):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Executor cannot change status from {current.value} to {target.value}"
+            )
+        crud.update_task_status(db, task_id, target)
+        return crud.get_task(db, task_id)
+
+    # Manager — может всё (статус, включая approve/reject)
+    if update.status:
+        task_status = TaskStatus(update.status.value)
+        crud.update_task_status(db, task_id, task_status)
+
+    update_data = {}
+    if update.description:
+        update_data['description'] = update.description
+    if update.priority:
+        update_data['priority'] = TaskPriority(update.priority.value)
+    if update.due_date:
+        update_data['due_date'] = update.due_date
+    if update.assignee_id:
+        update_data['assignee_id'] = update.assignee_id
+
+    if update_data:
+        crud.update_task(db, task_id, **update_data)
+
+    return crud.get_task(db, task_id)
 
 
 # ============ WebApp Auth ============
