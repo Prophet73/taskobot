@@ -19,10 +19,10 @@ mkdir -p data
 
 # Build and start
 echo "[*] Building containers..."
-docker compose -p "$COMPOSE_PROJECT" build
+docker compose build
 
 echo "[*] Starting $APP_NAME..."
-docker compose -p "$COMPOSE_PROJECT" up -d
+docker compose up -d
 
 # Health check
 echo "[*] Waiting for services..."
@@ -34,5 +34,5 @@ if curl -sf http://localhost:3000/api/health > /dev/null 2>&1; then
     echo "    API:      http://localhost:3000/api/health"
 else
     echo "[!] Health check failed. Check logs:"
-    echo "    docker compose -p $COMPOSE_PROJECT logs"
+    echo "    docker compose logs"
 fi
