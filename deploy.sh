@@ -2,7 +2,13 @@
 set -e
 
 APP_NAME="TaskoBot"
-COMPOSE_PROJECT="taskobot"
+
+# Detect docker compose command
+if docker compose version > /dev/null 2>&1; then
+    DC="docker compose"
+else
+    DC="docker-compose"
+fi
 
 echo "=== $APP_NAME Deploy ==="
 
@@ -19,10 +25,10 @@ mkdir -p data
 
 # Build and start
 echo "[*] Building containers..."
-docker compose build
+$DC build
 
 echo "[*] Starting $APP_NAME..."
-docker compose up -d
+$DC up -d
 
 # Health check
 echo "[*] Waiting for services..."
@@ -34,5 +40,5 @@ if curl -sf http://localhost:3000/api/health > /dev/null 2>&1; then
     echo "    API:      http://localhost:3000/api/health"
 else
     echo "[!] Health check failed. Check logs:"
-    echo "    docker compose logs"
+    echo "    $DC logs"
 fi
