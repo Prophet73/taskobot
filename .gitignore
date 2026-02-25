@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.env
+*.db
+node_modules/
+dist/
+.playwright-mcp/
+nul
