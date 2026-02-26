@@ -3,8 +3,8 @@ CRUD operations for Task Tracker v2
 """
 from datetime import datetime
 from typing import Optional, List
-from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_
+from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import and_, or_, func, case
 
 import secrets
 
@@ -129,13 +129,11 @@ def get_all_projects(db: Session) -> List[Project]:
 
 
 def get_user_projects(db: Session, user_id: int) -> List[Project]:
-    """Получить проекты пользователя"""
-    memberships = db.query(ProjectMembership).filter(
-        ProjectMembership.user_id == user_id
-    ).all()
-    project_ids = [m.project_id for m in memberships]
-    return db.query(Project).filter(
-        Project.id.in_(project_ids),
+    """Получить проекты пользователя — один JOIN запрос"""
+    return db.query(Project).join(
+        ProjectMembership, ProjectMembership.project_id == Project.id
+    ).filter(
+        ProjectMembership.user_id == user_id,
         Project.is_active == True
     ).all()
 
@@ -180,8 +178,10 @@ def get_project_members(db: Session, project_id: int) -> List[ProjectMembership]
 
 
 def get_project_managers(db: Session, project_id: int) -> List[User]:
-    """Получить менеджеров проекта"""
-    memberships = db.query(ProjectMembership).filter(
+    """Получить менеджеров проекта — с eager load user"""
+    memberships = db.query(ProjectMembership).options(
+        joinedload(ProjectMembership.user)
+    ).filter(
         ProjectMembership.project_id == project_id,
         ProjectMembership.role == Role.MANAGER
     ).all()
@@ -368,34 +368,25 @@ def delete_task(db: Session, task_id: int) -> bool:
 # ============ Statistics ============
 
 def get_project_stats(db: Session, project_id: int) -> dict:
-    """Статистика проекта"""
-    total = db.query(Task).filter(Task.project_id == project_id).count()
-    pending = db.query(Task).filter(
-        Task.project_id == project_id,
-        Task.status == TaskStatus.PENDING
-    ).count()
-    in_progress = db.query(Task).filter(
-        Task.project_id == project_id,
-        Task.status == TaskStatus.IN_PROGRESS
-    ).count()
-    pending_review = db.query(Task).filter(
-        Task.project_id == project_id,
-        Task.status == TaskStatus.PENDING_REVIEW
-    ).count()
-    done = db.query(Task).filter(
-        Task.project_id == project_id,
-        Task.status == TaskStatus.DONE
-    ).count()
-    members = db.query(ProjectMembership).filter(
+    """Статистика проекта — один агрегированный запрос вместо 6"""
+    row = db.query(
+        func.count(Task.id).label("total"),
+        func.count(case((Task.status == TaskStatus.PENDING, 1))).label("pending"),
+        func.count(case((Task.status == TaskStatus.IN_PROGRESS, 1))).label("in_progress"),
+        func.count(case((Task.status == TaskStatus.PENDING_REVIEW, 1))).label("pending_review"),
+        func.count(case((Task.status == TaskStatus.DONE, 1))).label("done"),
+    ).filter(Task.project_id == project_id).first()
+
+    members = db.query(func.count(ProjectMembership.id)).filter(
         ProjectMembership.project_id == project_id
-    ).count()
+    ).scalar()
 
     return {
-        "total_tasks": total,
-        "pending_tasks": pending,
-        "in_progress_tasks": in_progress,
-        "pending_review_tasks": pending_review,
-        "completed_tasks": done,
+        "total_tasks": row.total,
+        "pending_tasks": row.pending,
+        "in_progress_tasks": row.in_progress,
+        "pending_review_tasks": row.pending_review,
+        "completed_tasks": row.done,
         "members_count": members
     }
 

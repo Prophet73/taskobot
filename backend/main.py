@@ -286,6 +286,8 @@ async def get_tasks(
     project_id: Optional[int] = Query(None),
     status: Optional[str] = Query(None),
     assignee_id: Optional[int] = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
     current_user: CurrentUser = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -319,7 +321,7 @@ async def get_tasks(
     if assignee_id:
         query = query.filter(Task.assignee_id == assignee_id)
 
-    return query.order_by(Task.created_at.desc()).all()
+    return query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
 
 
 @app.get("/api/tasks/my", response_model=MyTasksResponse)
@@ -385,23 +387,27 @@ async def create_task(
         due_date=task_data.due_date
     )
 
-    # Уведомляем исполнителя через бот
+    # Уведомляем исполнителя через бот (в фоне, не блокируя API)
     if bot and task.assignee and task.assignee.telegram_id != 0:
         creator = current_user.user
         creator_name = f"@{creator.username}" if creator.username else creator.full_name or "Менеджер"
         project = crud.get_project(db, task_data.project_id)
         project_name = project.name if project else "Проект"
-        try:
-            await bot.bot.send_message(
-                task.assignee.telegram_id,
-                f"📋 <b>Новая задача #{task.id}!</b>\n\n"
-                f"📝 {task.description[:100]}\n\n"
-                f"👤 От: {creator_name}\n"
-                f"📁 Проект: {project_name}",
-                reply_markup=get_task_keyboard(task.id, task.status)
-            )
-        except Exception as e:
-            logger.warning(f"Failed to notify assignee via bot: {e}")
+
+        async def _notify():
+            try:
+                await bot.bot.send_message(
+                    task.assignee.telegram_id,
+                    f"📋 <b>Новая задача #{task.id}!</b>\n\n"
+                    f"📝 {task.description[:100]}\n\n"
+                    f"👤 От: {creator_name}\n"
+                    f"📁 Проект: {project_name}",
+                    reply_markup=get_task_keyboard(task.id, task.status)
+                )
+            except Exception as e:
+                logger.warning(f"Failed to notify assignee via bot: {e}")
+
+        asyncio.create_task(_notify())
 
     return task
 
@@ -458,7 +464,7 @@ async def update_task(
 
     updated_task = crud.get_task(db, task_id)
 
-    # Уведомляем нового исполнителя при смене
+    # Уведомляем нового исполнителя при смене (в фоне)
     if bot and update.assignee_id and update.assignee_id != old_assignee_id:
         new_assignee = crud.get_user(db, update.assignee_id)
         if new_assignee and new_assignee.telegram_id != 0:
@@ -466,17 +472,21 @@ async def update_task(
             project_name = project.name if project else "Проект"
             changer = current_user.user
             changer_name = f"@{changer.username}" if changer.username else changer.full_name or "Менеджер"
-            try:
-                await bot.bot.send_message(
-                    new_assignee.telegram_id,
-                    f"📋 <b>Тебе назначена задача #{updated_task.id}</b>\n\n"
-                    f"📝 {updated_task.description[:100]}\n\n"
-                    f"👤 От: {changer_name}\n"
-                    f"📁 Проект: {project_name}",
-                    reply_markup=get_task_keyboard(updated_task.id, updated_task.status)
-                )
-            except Exception as e:
-                logger.warning(f"Failed to notify new assignee: {e}")
+
+            async def _notify():
+                try:
+                    await bot.bot.send_message(
+                        new_assignee.telegram_id,
+                        f"📋 <b>Тебе назначена задача #{updated_task.id}</b>\n\n"
+                        f"📝 {updated_task.description[:100]}\n\n"
+                        f"👤 От: {changer_name}\n"
+                        f"📁 Проект: {project_name}",
+                        reply_markup=get_task_keyboard(updated_task.id, updated_task.status)
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to notify new assignee: {e}")
+
+            asyncio.create_task(_notify())
 
     return updated_task
 
@@ -646,7 +656,7 @@ async def create_comment(
 
     comment = crud.create_comment(db, task_id, current_user.user_id, comment_data.text)
 
-    # Уведомляем другую сторону через бот
+    # Уведомляем другую сторону через бот (в фоне)
     if bot:
         commenter = current_user.user
         commenter_name = f"@{commenter.username}" if commenter.username else commenter.full_name or "Пользователь"
@@ -656,28 +666,31 @@ async def create_comment(
             f"📝 {task.description[:60]}"
         )
 
-        # Если комментирует исполнитель — уведомляем менеджеров
-        if task.assignee_id == current_user.user_id:
-            managers = crud.get_project_managers(db, task.project_id)
-            for manager in managers:
-                if manager.telegram_id != 0 and manager.id != current_user.user_id:
+        async def _notify_comment():
+            # Если комментирует исполнитель — уведомляем менеджеров
+            if task.assignee_id == current_user.user_id:
+                managers = crud.get_project_managers(db, task.project_id)
+                for manager in managers:
+                    if manager.telegram_id != 0 and manager.id != current_user.user_id:
+                        try:
+                            await bot.bot.send_message(
+                                manager.telegram_id, notify_text,
+                                reply_markup=get_task_keyboard(task.id, task.status, is_manager=True)
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to notify manager about comment: {e}")
+            else:
+                # Иначе уведомляем исполнителя
+                if task.assignee and task.assignee.telegram_id != 0 and task.assignee_id != current_user.user_id:
                     try:
                         await bot.bot.send_message(
-                            manager.telegram_id, notify_text,
-                            reply_markup=get_task_keyboard(task.id, task.status, is_manager=True)
+                            task.assignee.telegram_id, notify_text,
+                            reply_markup=get_task_keyboard(task.id, task.status)
                         )
                     except Exception as e:
-                        logger.warning(f"Failed to notify manager about comment: {e}")
-        else:
-            # Иначе уведомляем исполнителя
-            if task.assignee and task.assignee.telegram_id != 0 and task.assignee_id != current_user.user_id:
-                try:
-                    await bot.bot.send_message(
-                        task.assignee.telegram_id, notify_text,
-                        reply_markup=get_task_keyboard(task.id, task.status)
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to notify assignee about comment: {e}")
+                        logger.warning(f"Failed to notify assignee about comment: {e}")
+
+        asyncio.create_task(_notify_comment())
 
     return comment
 

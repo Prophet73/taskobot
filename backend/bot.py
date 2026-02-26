@@ -2,6 +2,7 @@
 Telegram Bot for Task Tracking v2
 DM-only mode: все взаимодействие через личные сообщения
 """
+import asyncio
 import re
 import logging
 from datetime import datetime, date, timedelta
@@ -418,7 +419,7 @@ class TaskBot:
             logger.warning(f"Failed to notify assignee: {e}")
 
     async def notify_managers_review(self, task: Task, project_id: int):
-        """Уведомить менеджеров о задаче на проверке"""
+        """Уведомить менеджеров о задаче на проверке (параллельно)"""
         with get_db_session() as db:
             managers = crud.get_project_managers(db, project_id)
             project = crud.get_project(db, project_id)
@@ -430,16 +431,19 @@ class TaskBot:
                 f"📁 Проект: {project.name if project else 'Unknown'}"
             )
 
-            for manager in managers:
-                if manager.telegram_id != 0:
-                    try:
-                        await self.bot.send_message(
-                            manager.telegram_id,
-                            text,
-                            reply_markup=get_task_keyboard(task.id, task.status, is_manager=True)
-                        )
-                    except Exception as e:
-                        logger.warning(f"Failed to notify manager {manager.id}: {e}")
+            async def _send(manager):
+                try:
+                    await self.bot.send_message(
+                        manager.telegram_id,
+                        text,
+                        reply_markup=get_task_keyboard(task.id, task.status, is_manager=True)
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to notify manager {manager.id}: {e}")
+
+            coros = [_send(m) for m in managers if m.telegram_id != 0]
+            if coros:
+                await asyncio.gather(*coros)
 
     def _detect_priority(self, text: str) -> TaskPriority:
         """Определить приоритет из текста"""
@@ -2376,7 +2380,7 @@ class TaskBot:
     # ============ Reminders ============
 
     async def send_morning_reminders(self):
-        """Утренние автоматические напоминания"""
+        """Утренние автоматические напоминания (параллельно)"""
         with get_db_session() as db:
             tasks = crud.get_pending_tasks_for_reminders(db)
 
@@ -2389,14 +2393,16 @@ class TaskBot:
                     by_user[task.assignee_id] = {"user": task.assignee, "tasks": []}
                 by_user[task.assignee_id]["tasks"].append(task)
 
-            for data in by_user.values():
-                user = data["user"]
-                user_tasks = data["tasks"]
+            async def _send(user, user_tasks):
                 project_name = user_tasks[0].project.name if user_tasks[0].project else "Проект"
                 try:
                     await self.send_reminder_to_user(user, user_tasks, project_name)
                 except Exception as e:
                     logger.error(f"Failed morning reminder for user {user.id}: {e}")
+
+            coros = [_send(d["user"], d["tasks"]) for d in by_user.values()]
+            if coros:
+                await asyncio.gather(*coros)
 
     async def send_reminder_to_user(self, user: User, tasks: List[Task], project_name: str):
         """Публичный метод для отправки напоминания пользователю (вызывается из API)"""
@@ -2455,9 +2461,7 @@ class TaskBot:
             logger.error(f"Failed to send reminder to user {user.id}: {e}")
 
     async def send_project_reminders(self, project_id: int) -> int:
-        """Публичный метод для отправки напоминаний всем участникам проекта (из API)"""
-        sent_count = 0
-
+        """Публичный метод для отправки напоминаний всем участникам проекта (параллельно)"""
         with get_db_session() as db:
             project = crud.get_project(db, project_id)
             if not project:
@@ -2472,20 +2476,25 @@ class TaskBot:
                     by_user[task.assignee_id] = {"user": task.assignee, "tasks": []}
                 by_user[task.assignee_id]["tasks"].append(task)
 
-            for data in by_user.values():
-                user = data["user"]
-                user_tasks = data["tasks"]
+            results = []
 
-                if user.telegram_id == 0:
-                    continue
-
+            async def _send(user, user_tasks):
                 try:
                     await self.send_reminder_to_user(user, user_tasks, project.name)
-                    sent_count += 1
+                    return True
                 except Exception as e:
                     logger.error(f"Failed to send reminder: {e}")
+                    return False
 
-        return sent_count
+            eligible = [
+                (d["user"], d["tasks"])
+                for d in by_user.values()
+                if d["user"].telegram_id != 0
+            ]
+            if eligible:
+                results = await asyncio.gather(*[_send(u, t) for u, t in eligible])
+
+        return sum(1 for r in results if r)
 
     async def start(self):
         """Запуск бота"""

@@ -35,10 +35,14 @@ def generate_auth_code() -> str:
 
 def create_auth_code(db: Session, user_id: int) -> AuthCode:
     """Создать код авторизации для пользователя"""
-    # Удаляем старые неиспользованные коды
+    # Удаляем ВСЕ старые коды этого юзера (и использованные тоже — чтобы не было коллизий)
     db.query(AuthCode).filter(
-        AuthCode.user_id == user_id,
-        AuthCode.is_used == False
+        AuthCode.user_id == user_id
+    ).delete()
+
+    # Чистим просроченные коды всех юзеров
+    db.query(AuthCode).filter(
+        AuthCode.expires_at <= datetime.utcnow()
     ).delete()
     db.commit()
 
@@ -134,9 +138,11 @@ async def get_current_user(
             detail="User not found"
         )
 
-    # Обновляем last_seen
-    user.last_seen = datetime.utcnow()
-    db.commit()
+    # Обновляем last_seen только если прошло > 5 минут
+    now = datetime.utcnow()
+    if not user.last_seen or (now - user.last_seen).total_seconds() > 300:
+        user.last_seen = now
+        db.commit()
 
     return CurrentUser(
         user_id=user.id,
