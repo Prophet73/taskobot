@@ -4,7 +4,7 @@ DM-only mode: все взаимодействие через личные соо
 """
 import re
 import logging
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from typing import Optional, List
 
 from aiogram import Bot, Dispatcher, F
@@ -82,7 +82,8 @@ def get_task_keyboard(task_id: int, status: TaskStatus, is_manager: bool = False
             ])
 
     buttons.append([
-        InlineKeyboardButton(text="📋 Подробнее", callback_data=f"task_info_{task_id}")
+        InlineKeyboardButton(text="📋 Подробнее", callback_data=f"task_info_{task_id}"),
+        InlineKeyboardButton(text="💬 Комментарий", callback_data=f"comment_add_{task_id}")
     ])
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -202,6 +203,10 @@ class TaskBot:
         self.user_menu_context = {}
         # Черновик задачи: telegram_id -> {"project_id": int, "assignee_id": int, "assignee_name": str}
         self.user_task_draft = {}
+        # Черновик комментария: telegram_id -> {"task_id": int}
+        self.user_comment_draft = {}
+        # Контекст смены статуса: telegram_id -> {"task_id": int, "new_status": str}
+        self.user_status_comment = {}
         self._register_handlers()
 
     def _register_handlers(self):
@@ -234,6 +239,8 @@ class TaskBot:
         self.dp.callback_query.register(self.callback_project_select, F.data.startswith("project_"))
         self.dp.callback_query.register(self.callback_dm_action, F.data.startswith("dm_"))
         self.dp.callback_query.register(self.callback_newtask_assignee, F.data.startswith("newtask_"))
+        self.dp.callback_query.register(self.callback_comment, F.data.startswith("comment_"))
+        self.dp.callback_query.register(self.callback_skip_status_comment, F.data.startswith("skipstatus_"))
         self.dp.callback_query.register(self.callback_confirm_delete, F.data.startswith("confirmdelete_"))
         self.dp.callback_query.register(self.callback_cancel_delete, F.data == "canceldelete")
 
@@ -479,17 +486,9 @@ class TaskBot:
             flags = self._get_menu_flags(db, user, project)
 
             if projects:
-                # Определяем роль-метку
-                if flags["is_superadmin"]:
-                    role_badge = "👑 Суперадмин"
-                elif flags["is_admin"]:
-                    role_badge = "⚙️ Админ"
-                elif flags["is_manager"]:
-                    role_badge = "📋 Руководитель"
-                else:
-                    role_badge = "👤 Исполнитель"
+                name = user.full_name or user.username or "друг"
 
-                text = f"👋 Привет! {role_badge}\n\nТвои проекты:\n"
+                text = f"👋 Привет, {name}!\n\nТвои проекты:\n"
                 for p in projects:
                     stats = crud.get_project_stats(db, p.id)
                     active = stats['pending_tasks'] + stats['in_progress_tasks']
@@ -1166,15 +1165,31 @@ class TaskBot:
                     role = self._get_user_role_in_project(db, user.id, task.project_id)
                     is_manager = self._can_see_all_tasks(role)
 
-                text = f"""
-{p_emoji} <b>Задача #{task.id}</b> {s_emoji}
+                due_info = ""
+                if task.due_date:
+                    due_info = f"\n⏰ Дедлайн: {task.due_date.strftime('%d.%m.%Y')}"
 
-📝 {task.description}
+                text = (
+                    f"{p_emoji} <b>Задача #{task.id}</b> {s_emoji}\n\n"
+                    f"📝 {task.description}\n\n"
+                    f"👤 Исполнитель: {assignee}\n"
+                    f"📋 Создал: {creator}\n"
+                    f"📅 {task.created_at.strftime('%d.%m.%Y %H:%M')}"
+                    f"{due_info}"
+                )
 
-👤 Исполнитель: {assignee}
-📋 Создал: {creator}
-📅 {task.created_at.strftime('%d.%m.%Y %H:%M')}
-"""
+                # Показываем последние 3 комментария
+                comments = crud.get_task_comments(db, task_id)
+                if comments:
+                    last_comments = comments[-3:]
+                    text += "\n\n💬 <b>Комментарии:</b>"
+                    for c in last_comments:
+                        c_name = f"@{c.user.username}" if c.user.username else c.user.full_name or "?"
+                        c_text = c.text[:100] + "..." if len(c.text) > 100 else c.text
+                        text += f"\n{c_name}: {c_text}"
+                    if len(comments) > 3:
+                        text += f"\n<i>...и ещё {len(comments) - 3}</i>"
+
                 keyboard = get_task_keyboard(task_id, task.status, is_manager)
 
                 # Добавляем кнопку "К списку" если есть контекст
@@ -1218,6 +1233,28 @@ class TaskBot:
                 }
                 new_status = status_map[action]
 
+                # Для значимых смен статуса спрашиваем комментарий
+                if action in ["progress", "review", "done"]:
+                    self.user_status_comment[callback.from_user.id] = {
+                        "task_id": task_id,
+                        "new_status": new_status,
+                    }
+                    prompts = {
+                        "progress": "Что планируешь сделать?",
+                        "review": "Что сделано?",
+                        "done": "Итоговый комментарий?",
+                    }
+                    await callback.message.answer(
+                        f"💬 {prompts[action]}\n"
+                        f"<i>Напиши комментарий к задаче #{task_id} или /skip</i>",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="⏩ Пропустить", callback_data=f"skipstatus_{task_id}")]
+                        ])
+                    )
+                    await callback.answer()
+                    return
+
+                # Для "pending" меняем сразу без вопросов
                 crud.update_task_status_with_history(db, task_id, new_status, user.id)
 
                 status_text = {
@@ -2008,6 +2045,105 @@ class TaskBot:
         await callback.message.edit_text("❌ Удаление отменено.")
         await callback.answer()
 
+    async def callback_comment(self, callback: CallbackQuery):
+        """Кнопка 'Комментарий' — начать написание комментария"""
+        parts = callback.data.split("_")
+        # comment_add_{task_id}
+        if len(parts) < 3 or parts[1] != "add":
+            await callback.answer("Ошибка", show_alert=True)
+            return
+
+        task_id = int(parts[2])
+
+        if not callback.from_user:
+            return
+
+        with get_db_session() as db:
+            task = crud.get_task(db, task_id)
+            if not task:
+                await callback.answer("Задача не найдена", show_alert=True)
+                return
+
+        self.user_comment_draft[callback.from_user.id] = {"task_id": task_id}
+        await callback.message.answer(
+            f"✏️ Напиши комментарий к задаче <b>#{task_id}</b>:"
+        )
+        await callback.answer()
+
+    async def callback_skip_status_comment(self, callback: CallbackQuery):
+        """Пропустить комментарий при смене статуса"""
+        parts = callback.data.split("_")
+        # skipstatus_{task_id}
+        if len(parts) < 2:
+            await callback.answer("Ошибка", show_alert=True)
+            return
+
+        if not callback.from_user:
+            return
+
+        draft = self.user_status_comment.pop(callback.from_user.id, None)
+        if not draft:
+            await callback.answer("Нет активной смены статуса", show_alert=True)
+            return
+
+        task_id = draft["task_id"]
+        new_status = draft["new_status"]
+
+        with get_db_session() as db:
+            user = crud.get_or_create_user(db, callback.from_user.id, callback.from_user.username)
+            crud.update_task_status_with_history(db, task_id, new_status, user.id)
+
+            task = crud.get_task(db, task_id)
+            status_names = {
+                TaskStatus.IN_PROGRESS: "🔄 В работе",
+                TaskStatus.PENDING_REVIEW: "📝 На проверке",
+                TaskStatus.DONE: "✅ Выполнено",
+                TaskStatus.PENDING: "⏳ Ожидает",
+            }
+            status_text = status_names.get(new_status, str(new_status))
+
+            await callback.message.edit_text(
+                f"{status_text} — задача <b>#{task_id}</b>"
+            )
+
+            if new_status == TaskStatus.PENDING_REVIEW:
+                await self.notify_managers_review(task, task.project_id)
+
+        await callback.answer()
+
+    async def notify_comment(self, db, task: Task, commenter_user_id: int, comment_text: str):
+        """Уведомить о новом комментарии: исполнителя или менеджеров"""
+        commenter = crud.get_user(db, commenter_user_id)
+        commenter_name = f"@{commenter.username}" if commenter and commenter.username else (commenter.full_name if commenter else "?")
+        notify_text = (
+            f"💬 <b>Новый комментарий к задаче #{task.id}</b>\n\n"
+            f"{commenter_name}: {comment_text[:200]}\n\n"
+            f"📝 {task.description[:60]}"
+        )
+
+        if task.assignee_id == commenter_user_id:
+            # Комментарий от исполнителя — уведомляем менеджеров
+            managers = crud.get_project_managers(db, task.project_id)
+            for manager in managers:
+                if manager.telegram_id != 0 and manager.id != commenter_user_id:
+                    try:
+                        await self.bot.send_message(
+                            manager.telegram_id, notify_text,
+                            reply_markup=get_task_keyboard(task.id, task.status, is_manager=True)
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to notify manager about comment: {e}")
+        else:
+            # Комментарий от менеджера — уведомляем исполнителя
+            if task.assignee and task.assignee.telegram_id != 0 and task.assignee_id != commenter_user_id:
+                try:
+                    await self.bot.send_message(
+                        task.assignee.telegram_id, notify_text,
+                        reply_markup=get_task_keyboard(task.id, task.status)
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to notify assignee about comment: {e}")
+
     async def callback_remind(self, callback: CallbackQuery):
         """Обработка напоминаний"""
         parts = callback.data.split("_")
@@ -2068,6 +2204,69 @@ class TaskBot:
             return
 
         if not message.from_user or not message.text:
+            return
+
+        # Проверяем черновик комментария к смене статуса
+        status_draft = self.user_status_comment.get(message.from_user.id)
+        if status_draft:
+            text = message.text.strip()
+            if text.lower() == "/skip":
+                # Пропустить — просто сменить статус
+                self.user_status_comment.pop(message.from_user.id, None)
+                with get_db_session() as db:
+                    user = crud.get_or_create_user(db, message.from_user.id, message.from_user.username)
+                    crud.update_task_status_with_history(db, status_draft["task_id"], status_draft["new_status"], user.id)
+                    task = crud.get_task(db, status_draft["task_id"])
+                    status_names = {
+                        TaskStatus.IN_PROGRESS: "🔄 В работе",
+                        TaskStatus.PENDING_REVIEW: "📝 На проверке",
+                        TaskStatus.DONE: "✅ Выполнено",
+                        TaskStatus.PENDING: "⏳ Ожидает",
+                    }
+                    await message.reply(f"{status_names.get(status_draft['new_status'], '✓')} — задача <b>#{status_draft['task_id']}</b>")
+                    if status_draft["new_status"] == TaskStatus.PENDING_REVIEW:
+                        await self.notify_managers_review(task, task.project_id)
+                return
+            else:
+                # Сохраняем комментарий и меняем статус
+                self.user_status_comment.pop(message.from_user.id, None)
+                with get_db_session() as db:
+                    user = crud.get_or_create_user(db, message.from_user.id, message.from_user.username, message.from_user.full_name)
+                    crud.create_comment(db, status_draft["task_id"], user.id, text)
+                    crud.update_task_status_with_history(db, status_draft["task_id"], status_draft["new_status"], user.id)
+                    task = crud.get_task(db, status_draft["task_id"])
+                    status_names = {
+                        TaskStatus.IN_PROGRESS: "🔄 В работе",
+                        TaskStatus.PENDING_REVIEW: "📝 На проверке",
+                        TaskStatus.DONE: "✅ Выполнено",
+                        TaskStatus.PENDING: "⏳ Ожидает",
+                    }
+                    await message.reply(
+                        f"{status_names.get(status_draft['new_status'], '✓')} — задача <b>#{status_draft['task_id']}</b>\n"
+                        f"💬 Комментарий сохранён"
+                    )
+                    if status_draft["new_status"] == TaskStatus.PENDING_REVIEW:
+                        await self.notify_managers_review(task, task.project_id)
+                    await self.notify_comment(db, task, user.id, text)
+                return
+
+        # Проверяем черновик комментария
+        comment_draft = self.user_comment_draft.pop(message.from_user.id, None)
+        if comment_draft:
+            text = message.text.strip()
+            if not text:
+                self.user_comment_draft[message.from_user.id] = comment_draft
+                await message.reply("✏️ Напиши текст комментария:")
+                return
+
+            task_id = comment_draft["task_id"]
+            with get_db_session() as db:
+                user = crud.get_or_create_user(db, message.from_user.id, message.from_user.username, message.from_user.full_name)
+                crud.create_comment(db, task_id, user.id, text)
+                task = crud.get_task(db, task_id)
+                await message.reply(f"💬 Комментарий к задаче <b>#{task_id}</b> добавлен!")
+                if task:
+                    await self.notify_comment(db, task, user.id, text)
             return
 
         # Проверяем черновик задачи (пользователь выбрал исполнителя через кнопку)
@@ -2205,11 +2404,48 @@ class TaskBot:
             return
 
         mention = f"@{user.username}" if user.username else user.full_name
+        today = date.today()
+        tomorrow = today + timedelta(days=1)
+
+        # Разделяем задачи: горящие сверху
+        burning = []
+        tomorrow_tasks = []
+        regular = []
+
+        for t in tasks:
+            if t.due_date:
+                due = t.due_date.date() if isinstance(t.due_date, datetime) else t.due_date
+                if due <= today:
+                    burning.append(t)
+                elif due == tomorrow:
+                    tomorrow_tasks.append(t)
+                else:
+                    regular.append(t)
+            else:
+                regular.append(t)
 
         text = f"📢 <b>{mention}</b>, напоминание о задачах ({project_name}):\n\n"
-        for t in tasks:
-            emoji = PRIORITY_EMOJI.get(t.priority, "")
-            text += f"{emoji} #{t.id}: {t.description[:50]}\n"
+
+        if burning:
+            text += "🔥 <b>Горит сегодня:</b>\n"
+            for t in burning:
+                emoji = PRIORITY_EMOJI.get(t.priority, "")
+                text += f"{emoji} #{t.id}: {t.description[:50]}\n"
+            text += "\n"
+
+        if tomorrow_tasks:
+            text += "⏰ <b>Дедлайн завтра:</b>\n"
+            for t in tomorrow_tasks:
+                emoji = PRIORITY_EMOJI.get(t.priority, "")
+                text += f"{emoji} #{t.id}: {t.description[:50]}\n"
+            text += "\n"
+
+        if regular:
+            if burning or tomorrow_tasks:
+                text += "📋 <b>Остальные:</b>\n"
+            for t in regular:
+                emoji = PRIORITY_EMOJI.get(t.priority, "")
+                text += f"{emoji} #{t.id}: {t.description[:50]}\n"
 
         text += f"\n📊 Всего: {len(tasks)}"
 

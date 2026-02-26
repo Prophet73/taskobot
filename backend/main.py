@@ -24,7 +24,7 @@ from schemas import (
     WebAppAuthRequest
 )
 import crud
-from bot import TaskBot
+from bot import TaskBot, get_task_keyboard
 from config import BOT_TOKEN, MORNING_REMINDER_HOUR, ALLOWED_ORIGINS
 from auth import (
     get_current_user, get_current_user_optional, CurrentUser,
@@ -384,6 +384,25 @@ async def create_task(
         priority=priority,
         due_date=task_data.due_date
     )
+
+    # Уведомляем исполнителя через бот
+    if bot and task.assignee and task.assignee.telegram_id != 0:
+        creator = current_user.user
+        creator_name = f"@{creator.username}" if creator.username else creator.full_name or "Менеджер"
+        project = crud.get_project(db, task_data.project_id)
+        project_name = project.name if project else "Проект"
+        try:
+            await bot.bot.send_message(
+                task.assignee.telegram_id,
+                f"📋 <b>Новая задача #{task.id}!</b>\n\n"
+                f"📝 {task.description[:100]}\n\n"
+                f"👤 От: {creator_name}\n"
+                f"📁 Проект: {project_name}",
+                reply_markup=get_task_keyboard(task.id, task.status)
+            )
+        except Exception as e:
+            logger.warning(f"Failed to notify assignee via bot: {e}")
+
     return task
 
 
@@ -418,6 +437,8 @@ async def update_task(
         return crud.get_task(db, task_id)
 
     # Менеджер может всё
+    old_assignee_id = task.assignee_id
+
     if update.status:
         task_status = TaskStatus(update.status.value)
         crud.update_task_status_with_history(db, task_id, task_status, current_user.user_id)
@@ -435,7 +456,29 @@ async def update_task(
     if update_data:
         crud.update_task(db, task_id, **update_data)
 
-    return crud.get_task(db, task_id)
+    updated_task = crud.get_task(db, task_id)
+
+    # Уведомляем нового исполнителя при смене
+    if bot and update.assignee_id and update.assignee_id != old_assignee_id:
+        new_assignee = crud.get_user(db, update.assignee_id)
+        if new_assignee and new_assignee.telegram_id != 0:
+            project = crud.get_project(db, updated_task.project_id)
+            project_name = project.name if project else "Проект"
+            changer = current_user.user
+            changer_name = f"@{changer.username}" if changer.username else changer.full_name or "Менеджер"
+            try:
+                await bot.bot.send_message(
+                    new_assignee.telegram_id,
+                    f"📋 <b>Тебе назначена задача #{updated_task.id}</b>\n\n"
+                    f"📝 {updated_task.description[:100]}\n\n"
+                    f"👤 От: {changer_name}\n"
+                    f"📁 Проект: {project_name}",
+                    reply_markup=get_task_keyboard(updated_task.id, updated_task.status)
+                )
+            except Exception as e:
+                logger.warning(f"Failed to notify new assignee: {e}")
+
+    return updated_task
 
 
 @app.delete("/api/tasks/{task_id}")
@@ -601,7 +644,42 @@ async def create_comment(
     if not membership:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    return crud.create_comment(db, task_id, current_user.user_id, comment_data.text)
+    comment = crud.create_comment(db, task_id, current_user.user_id, comment_data.text)
+
+    # Уведомляем другую сторону через бот
+    if bot:
+        commenter = current_user.user
+        commenter_name = f"@{commenter.username}" if commenter.username else commenter.full_name or "Пользователь"
+        notify_text = (
+            f"💬 <b>Новый комментарий к задаче #{task.id}</b>\n\n"
+            f"{commenter_name}: {comment_data.text[:200]}\n\n"
+            f"📝 {task.description[:60]}"
+        )
+
+        # Если комментирует исполнитель — уведомляем менеджеров
+        if task.assignee_id == current_user.user_id:
+            managers = crud.get_project_managers(db, task.project_id)
+            for manager in managers:
+                if manager.telegram_id != 0 and manager.id != current_user.user_id:
+                    try:
+                        await bot.bot.send_message(
+                            manager.telegram_id, notify_text,
+                            reply_markup=get_task_keyboard(task.id, task.status, is_manager=True)
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to notify manager about comment: {e}")
+        else:
+            # Иначе уведомляем исполнителя
+            if task.assignee and task.assignee.telegram_id != 0 and task.assignee_id != current_user.user_id:
+                try:
+                    await bot.bot.send_message(
+                        task.assignee.telegram_id, notify_text,
+                        reply_markup=get_task_keyboard(task.id, task.status)
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to notify assignee about comment: {e}")
+
+    return comment
 
 
 @app.delete("/api/comments/{comment_id}")
